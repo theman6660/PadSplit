@@ -1,0 +1,30 @@
+# Build & distribution outputs
+/build/
+/dist/
+.ninja_deps
+.ninja_log
+*.o
+*.obj
+*.res
+*.pdb
+*.tmp
+
+# Downloaded toolchain & third-party sources (fetched by scripts/setup_deps.py)
+/tools/
+/third_party/
+
+# Runtime user config
+config.json
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# IDE / OS metadata
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+Thumbs.db
+.DS_Store
