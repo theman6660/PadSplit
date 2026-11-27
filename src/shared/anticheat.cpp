@@ -237,8 +237,10 @@ AntiCheatResult CheckAntiCheat(uint32_t pid, const std::wstring& exePath) {
 
     std::string activeDriver = FindActiveKernelAcDriver();
     if (!activeDriver.empty()) {
-        // Hard block if an active kernel AC driver matches directory marker or is a game-scoped kernel driver
-        if (!dirMarkerFound.empty() || activeDriver == "randgrid.sys" ||
+        // Hard block if an active kernel AC driver matches a directory marker, or is a transient game-scoped kernel driver.
+        // Note: randgrid.sys (COD Ricochet) can remain loaded in the kernel after COD exits, so only block on it when
+        // the target game itself matches kProtectedExes, loaded AC modules, or a directory marker.
+        if (!dirMarkerFound.empty() ||
             activeDriver == "bedaisy.sys" || activeDriver.rfind("easyanticheat", 0) == 0) {
             res.blocked = true;
             res.level = "block";
