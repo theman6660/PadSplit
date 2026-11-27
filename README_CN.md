@@ -45,7 +45,8 @@ Windows 同一时刻只允许一个“前台焦点窗口”。双屏环境下，
 - **全通道手柄后台保活**：
   - **XInput**（`xinput1_4` / `xinput1_3` / `xinput9_1_0`，拦截 `XInputEnable(FALSE)`）
   - **DirectInput 8**（自动改写为 `DISCL_BACKGROUND | DISCL_NONEXCLUSIVE` 并自动重获设备）
-  - **Raw Input**（自动为手柄 HID 设备补齐 `RIDEV_INPUTSINK`）
+  - **Raw Input**（自动为手柄/摇杆/多轴 HID 设备补齐 `RIDEV_INPUTSINK`，并将后台 HID 消息的 `RIM_INPUTSINK` 改写为 `RIM_INPUT`）
+  - **Windows.Gaming.Input (WinRT)**（Hook `IGamepad::GetCurrentReading` 与 `IRawGameController::GetCurrentReading`，游戏在后台时无缝桥接实时 XInput 状态——完美解决 Unity 2021+/Unity 6 及 WGI 游戏切屏失灵问题）
   - **Microsoft GameInput (v1–v4)**（自动开启后台输入策略并过滤键鼠读取）
   - **DirectSound**（自动附加 `DSBCAPS_GLOBALFOCUS` 兜底老游戏后台静音问题）
 - **分层全屏保持**：默认采用零渲染侵入的窗口去边框铺满主屏（兼容 ReShade / RTSS / DLSS 覆盖层）；对仅支持独占全屏的老游戏提供可选 `force-dx`（DXGI / D3D9 强转无边框）。

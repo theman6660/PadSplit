@@ -100,22 +100,27 @@ static void FilterPeekedMessage(LPMSG lpMsg, UINT wRemoveMsg) {
         }
     }
 
+    if (lpMsg->message == WM_INPUT) {
+        RAWINPUTHEADER hdr{};
+        UINT sz = sizeof(hdr);
+        auto fnGetRaw = g_origGetRawInputData ? g_origGetRawInputData : GetRawInputData;
+        if (fnGetRaw(reinterpret_cast<HRAWINPUT>(lpMsg->lParam), RID_HEADER, &hdr, &sz, sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1)) {
+            if (ShouldBlockKBM() && (hdr.dwType == RIM_TYPEMOUSE || hdr.dwType == RIM_TYPEKEYBOARD)) {
+                lpMsg->message = WM_NULL;
+                shm_inc64(&g_shm->blocked_raw_kbm);
+                return;
+            }
+            if (ShouldSpoofFocus() && hdr.dwType == RIM_TYPEHID && GET_RAWINPUT_CODE_WPARAM(lpMsg->wParam) == RIM_INPUTSINK) {
+                lpMsg->wParam = RIM_INPUT;
+            }
+        }
+    }
+
     if (ShouldBlockKBM()) {
         if (IsKbmWindowMessage(lpMsg->message)) {
             lpMsg->message = WM_NULL;
             shm_inc64(&g_shm->blocked_kbm_polls);
             return;
-        }
-        if (lpMsg->message == WM_INPUT) {
-            RAWINPUTHEADER hdr{};
-            UINT sz = sizeof(hdr);
-            auto fnGetRaw = g_origGetRawInputData ? g_origGetRawInputData : GetRawInputData;
-            if (fnGetRaw(reinterpret_cast<HRAWINPUT>(lpMsg->lParam), RID_HEADER, &hdr, &sz, sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1)) {
-                if (hdr.dwType == RIM_TYPEMOUSE || hdr.dwType == RIM_TYPEKEYBOARD) {
-                    lpMsg->message = WM_NULL;
-                    shm_inc64(&g_shm->blocked_raw_kbm);
-                }
-            }
         }
     }
 }
@@ -184,21 +189,25 @@ static LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         }
     }
 
+    if (msg == WM_INPUT) {
+        RAWINPUTHEADER hdr{};
+        UINT sz = sizeof(hdr);
+        auto fnGetRaw = g_origGetRawInputData ? g_origGetRawInputData : GetRawInputData;
+        if (fnGetRaw(reinterpret_cast<HRAWINPUT>(lParam), RID_HEADER, &hdr, &sz, sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1)) {
+            if (ShouldBlockKBM() && (hdr.dwType == RIM_TYPEMOUSE || hdr.dwType == RIM_TYPEKEYBOARD)) {
+                shm_inc64(&g_shm->blocked_raw_kbm);
+                return 0;
+            }
+            if (ShouldSpoofFocus() && hdr.dwType == RIM_TYPEHID && GET_RAWINPUT_CODE_WPARAM(wParam) == RIM_INPUTSINK) {
+                wParam = RIM_INPUT;
+            }
+        }
+    }
+
     if (ShouldBlockKBM()) {
         if (IsKbmWindowMessage(msg)) {
             shm_inc64(&g_shm->blocked_kbm_polls);
             return 0;
-        }
-        if (msg == WM_INPUT) {
-            RAWINPUTHEADER hdr{};
-            UINT sz = sizeof(hdr);
-            auto fnGetRaw = g_origGetRawInputData ? g_origGetRawInputData : GetRawInputData;
-            if (fnGetRaw(reinterpret_cast<HRAWINPUT>(lParam), RID_HEADER, &hdr, &sz, sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1)) {
-                if (hdr.dwType == RIM_TYPEMOUSE || hdr.dwType == RIM_TYPEKEYBOARD) {
-                    shm_inc64(&g_shm->blocked_raw_kbm);
-                    return 0;
-                }
-            }
         }
     }
 

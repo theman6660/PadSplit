@@ -59,7 +59,7 @@ static CRITICAL_SECTION g_rawSaveCs;
 static bool g_rawSaveCsInit = false;
 
 static bool IsRawGamepadUsage(USHORT page, USHORT usage) {
-    return page == 0x01 && (usage == 0x04 || usage == 0x05);
+    return page == 0x01 && (usage == 0x04 || usage == 0x05 || usage == 0x08);
 }
 
 static bool IsRawMouseUsage(USHORT page, USHORT usage) {
@@ -337,6 +337,8 @@ static bool g_dinputHooked = false;
 
 static CRITICAL_SECTION g_diCacheCs;
 static bool g_diCacheInit = false;
+static CRITICAL_SECTION g_wgiCacheCs;
+static bool g_wgiCacheInit = false;
 
 struct DICacheEntry {
     void* dev;
@@ -499,6 +501,10 @@ bool InstallInputHooks() {
     if (!g_diCacheInit) {
         InitializeCriticalSection(&g_diCacheCs);
         g_diCacheInit = true;
+    }
+    if (!g_wgiCacheInit) {
+        InitializeCriticalSection(&g_wgiCacheCs);
+        g_wgiCacheInit = true;
     }
 
     HMODULE user32 = GetModuleHandleW(L"user32.dll");
@@ -671,13 +677,491 @@ static void TryHookGameInput() {
     CoreLog("Hooked Microsoft GameInput v%d (background gamepad enabled + KBM filtered)", giVer);
 }
 
+// ---- Windows.Gaming.Input (WinRT) Lazy Hooks ----
+// Windows.Gaming.Input intentionally returns zeroed readings when the calling process is not
+// the real OS foreground window. When PadSplit is spoofing focus in the background, bridge
+// IGamepad::GetCurrentReading and IRawGameController::GetCurrentReading from live XInput state.
+static const GUID kIID_IGamepadStatics = {0x8bbce529, 0xd49c, 0x39e9, {0x95, 0x60, 0xe4, 0x7d, 0xde, 0x96, 0xb7, 0xc8}};
+static const GUID kIID_IRawGameControllerStatics = {0xeb8d0792, 0xe95a, 0x4b19, {0xaf, 0xc7, 0x0a, 0x59, 0xf8, 0xbf, 0x75, 0x9e}};
+
+struct WgiHStringHeader {
+    union {
+        void* Reserved1;
+        char Reserved2[sizeof(void*) == 8 ? 24 : 20];
+    } Reserved;
+};
+using WgiHString = void*;
+
+struct WgiGamepadReading {
+    uint64_t Timestamp;
+    uint32_t Buttons;
+    uint32_t _pad;
+    double LeftTrigger;
+    double RightTrigger;
+    double LeftThumbstickX;
+    double LeftThumbstickY;
+    double RightThumbstickX;
+    double RightThumbstickY;
+};
+static_assert(sizeof(WgiGamepadReading) == 64, "WgiGamepadReading size mismatch");
+
+using FnRoInitialize = HRESULT(WINAPI*)(int);
+using FnRoGetActivationFactory = HRESULT(WINAPI*)(WgiHString, REFIID, void**);
+using FnWindowsCreateStringReference = HRESULT(WINAPI*)(PCWSTR, UINT32, WgiHStringHeader*, WgiHString*);
+
+using FnWgiStaticsGetList = HRESULT(STDMETHODCALLTYPE*)(void*, void**);
+using FnWgiVecGetAt = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, void**);
+using FnWgiVecGetSize = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t*);
+using FnWgiGamepadGetReading = HRESULT(STDMETHODCALLTYPE*)(void*, WgiGamepadReading*);
+using FnWgiRawGetButtonLabel = HRESULT(STDMETHODCALLTYPE*)(void*, int32_t, int32_t*);
+using FnWgiRawGetReading = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, uint8_t*, uint32_t, int32_t*, uint32_t, double*, uint64_t*);
+using FnXInputGetStateRaw = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
+
+static FnWgiGamepadGetReading g_origWgiGamepadGetReading = nullptr;
+static FnWgiRawGetReading g_origWgiRawGetReading = nullptr;
+static bool g_wgiRoInitDone = false;
+static bool g_wgiGamepadHooked = false;
+static bool g_wgiRawHooked = false;
+static bool g_wgiGamepadCallLogged = false;
+static bool g_wgiGamepadBridgeLogged = false;
+static bool g_wgiRawCallLogged = false;
+static bool g_wgiRawBridgeLogged = false;
+static FnXInputGetStateRaw g_fallbackXInputGetState = nullptr;
+
+struct WgiRawCacheEntry {
+    void* dev;
+    uint32_t btnCount;
+    int32_t labels[32];
+};
+static WgiRawCacheEntry g_wgiRawCache[16]{};
+static int g_wgiRawCacheCount = 0;
+
+static uint64_t NowMicrosecondsQpc() {
+    static LARGE_INTEGER s_freq = []() {
+        LARGE_INTEGER f{};
+        QueryPerformanceFrequency(&f);
+        return f;
+    }();
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    if (s_freq.QuadPart <= 0) return GetTickCount64() * 1000ULL;
+    return static_cast<uint64_t>((now.QuadPart * 1000000LL) / s_freq.QuadPart);
+}
+
+static bool ReadBackgroundXInput(DWORD preferredSlot, XINPUT_STATE* outState, DWORD* outUsedSlot) {
+    if (!outState) return false;
+    FnXInputGetStateRaw fn = nullptr;
+    for (int i = 0; i < 3; ++i) {
+        if (g_xinputSlots[i].origGetState) {
+            fn = g_xinputSlots[i].origGetState;
+            break;
+        }
+    }
+    if (!fn) {
+        if (!g_fallbackXInputGetState) {
+            const wchar_t* dlls[] = {L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll"};
+            for (const wchar_t* name : dlls) {
+                HMODULE m = GetModuleHandleW(name);
+                if (!m) m = LoadLibraryW(name);
+                if (m) {
+                    auto p = reinterpret_cast<FnXInputGetStateRaw>(GetProcAddress(m, "XInputGetState"));
+                    if (p) {
+                        g_fallbackXInputGetState = p;
+                        break;
+                    }
+                }
+            }
+        }
+        fn = g_fallbackXInputGetState;
+    }
+    if (!fn) return false;
+
+    if (preferredSlot < 4 && fn(preferredSlot, outState) == ERROR_SUCCESS) {
+        if (outUsedSlot) *outUsedSlot = preferredSlot;
+        return true;
+    }
+    for (DWORD s = 0; s < 4; ++s) {
+        if (s == preferredSlot) continue;
+        if (fn(s, outState) == ERROR_SUCCESS) {
+            if (outUsedSlot) *outUsedSlot = s;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool IsGameCurrentlyBackground() {
+    if (!g_gameHwnd || !IsWindow(g_gameHwnd)) return false;
+    HWND realFg = g_origGetForegroundWindow ? g_origGetForegroundWindow() : GetForegroundWindow();
+    return realFg != g_gameHwnd;
+}
+
+static double NormalizeThumbSigned(SHORT v) {
+    if (v <= -32768) return -1.0;
+    return static_cast<double>(v) / 32767.0;
+}
+
+static double NormalizeThumbUnit(SHORT v, bool invert) {
+    double u = (static_cast<double>(v) + 32768.0) / 65535.0;
+    if (u < 0.0) u = 0.0;
+    if (u > 1.0) u = 1.0;
+    return invert ? (1.0 - u) : u;
+}
+
+static int32_t DpadToSwitchPos(WORD wButtons) {
+    bool up = (wButtons & XINPUT_GAMEPAD_DPAD_UP) != 0;
+    bool down = (wButtons & XINPUT_GAMEPAD_DPAD_DOWN) != 0;
+    bool left = (wButtons & XINPUT_GAMEPAD_DPAD_LEFT) != 0;
+    bool right = (wButtons & XINPUT_GAMEPAD_DPAD_RIGHT) != 0;
+    if (up && right) return 2;
+    if (down && right) return 4;
+    if (down && left) return 6;
+    if (up && left) return 8;
+    if (up) return 1;
+    if (right) return 3;
+    if (down) return 5;
+    if (left) return 7;
+    return 0;
+}
+
+static HRESULT STDMETHODCALLTYPE Hooked_WGI_Gamepad_GetCurrentReading(void* self, WgiGamepadReading* value) {
+    HRESULT hr = g_origWgiGamepadGetReading(self, value);
+    if (!g_wgiGamepadCallLogged) {
+        g_wgiGamepadCallLogged = true;
+        CoreLog("WGI IGamepad::GetCurrentReading active");
+    }
+    if (SUCCEEDED(hr) && value && ShouldSpoofFocus() && IsGameCurrentlyBackground()) {
+        XINPUT_STATE xs{};
+        DWORD usedSlot = 0;
+        if (ReadBackgroundXInput(0, &xs, &usedSlot)) {
+            WORD b = xs.Gamepad.wButtons;
+            uint32_t wb = 0;
+            if (b & XINPUT_GAMEPAD_START)          wb |= 0x0001u; // Menu
+            if (b & XINPUT_GAMEPAD_BACK)           wb |= 0x0002u; // View
+            if (b & XINPUT_GAMEPAD_A)              wb |= 0x0004u; // A
+            if (b & XINPUT_GAMEPAD_B)              wb |= 0x0008u; // B
+            if (b & XINPUT_GAMEPAD_X)              wb |= 0x0010u; // X
+            if (b & XINPUT_GAMEPAD_Y)              wb |= 0x0020u; // Y
+            if (b & XINPUT_GAMEPAD_DPAD_UP)        wb |= 0x0040u; // DPadUp
+            if (b & XINPUT_GAMEPAD_DPAD_DOWN)      wb |= 0x0080u; // DPadDown
+            if (b & XINPUT_GAMEPAD_DPAD_LEFT)      wb |= 0x0100u; // DPadLeft
+            if (b & XINPUT_GAMEPAD_DPAD_RIGHT)     wb |= 0x0200u; // DPadRight
+            if (b & XINPUT_GAMEPAD_LEFT_SHOULDER)  wb |= 0x0400u; // LeftShoulder
+            if (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) wb |= 0x0800u; // RightShoulder
+            if (b & XINPUT_GAMEPAD_LEFT_THUMB)     wb |= 0x1000u; // LeftThumbstick
+            if (b & XINPUT_GAMEPAD_RIGHT_THUMB)    wb |= 0x2000u; // RightThumbstick
+
+            value->Timestamp = NowMicrosecondsQpc();
+            value->Buttons = wb;
+            value->LeftTrigger = static_cast<double>(xs.Gamepad.bLeftTrigger) / 255.0;
+            value->RightTrigger = static_cast<double>(xs.Gamepad.bRightTrigger) / 255.0;
+            value->LeftThumbstickX = NormalizeThumbSigned(xs.Gamepad.sThumbLX);
+            value->LeftThumbstickY = NormalizeThumbSigned(xs.Gamepad.sThumbLY);
+            value->RightThumbstickX = NormalizeThumbSigned(xs.Gamepad.sThumbRX);
+            value->RightThumbstickY = NormalizeThumbSigned(xs.Gamepad.sThumbRY);
+
+            if (!g_wgiGamepadBridgeLogged) {
+                g_wgiGamepadBridgeLogged = true;
+                CoreLog("WGI IGamepad background read bridged via XInput (slot=%lu)", static_cast<unsigned long>(usedSlot));
+            }
+        }
+    }
+    return hr;
+}
+
+static bool MapLabelToXInputButton(int32_t label, WORD wButtons, BYTE lt, BYTE rt, uint8_t& outPressed) {
+    switch (label) {
+    case 1:  // XboxBack
+    case 4:  // XboxView
+    case 24: // Select
+    case 26: // View
+    case 27: // Back
+        outPressed = (wButtons & XINPUT_GAMEPAD_BACK) ? 1 : 0;
+        return true;
+    case 2:  // XboxStart
+    case 3:  // XboxMenu
+    case 25: // Menu
+    case 28: // Start
+    case 29: // Options
+        outPressed = (wButtons & XINPUT_GAMEPAD_START) ? 1 : 0;
+        return true;
+    case 5:  // XboxUp
+    case 31: // Up
+        outPressed = (wButtons & XINPUT_GAMEPAD_DPAD_UP) ? 1 : 0;
+        return true;
+    case 6:  // XboxDown
+    case 32: // Down
+        outPressed = (wButtons & XINPUT_GAMEPAD_DPAD_DOWN) ? 1 : 0;
+        return true;
+    case 7:  // XboxLeft
+    case 33: // Left
+        outPressed = (wButtons & XINPUT_GAMEPAD_DPAD_LEFT) ? 1 : 0;
+        return true;
+    case 8:  // XboxRight
+    case 34: // Right
+        outPressed = (wButtons & XINPUT_GAMEPAD_DPAD_RIGHT) ? 1 : 0;
+        return true;
+    case 9:  // XboxA
+    case 35: // LetterA
+    case 43: // Cross
+        outPressed = (wButtons & XINPUT_GAMEPAD_A) ? 1 : 0;
+        return true;
+    case 10: // XboxB
+    case 36: // LetterB
+    case 44: // Circle
+        outPressed = (wButtons & XINPUT_GAMEPAD_B) ? 1 : 0;
+        return true;
+    case 11: // XboxX
+    case 40: // LetterX
+        outPressed = (wButtons & XINPUT_GAMEPAD_X) ? 1 : 0;
+        return true;
+    case 12: // XboxY
+    case 41: // LetterY
+        outPressed = (wButtons & XINPUT_GAMEPAD_Y) ? 1 : 0;
+        return true;
+    case 13: // XboxLeftBumper
+        outPressed = (wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 1 : 0;
+        return true;
+    case 14: // XboxLeftTrigger
+        outPressed = (lt > 30) ? 1 : 0;
+        return true;
+    case 15: // XboxLeftStickButton
+        outPressed = (wButtons & XINPUT_GAMEPAD_LEFT_THUMB) ? 1 : 0;
+        return true;
+    case 16: // XboxRightBumper
+        outPressed = (wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 1 : 0;
+        return true;
+    case 17: // XboxRightTrigger
+        outPressed = (rt > 30) ? 1 : 0;
+        return true;
+    case 18: // XboxRightStickButton
+        outPressed = (wButtons & XINPUT_GAMEPAD_RIGHT_THUMB) ? 1 : 0;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static const WgiRawCacheEntry* GetOrInitWgiRawLabels(void* self, uint32_t btnCount) {
+    if (!self) return nullptr;
+    if (btnCount > 32) btnCount = 32;
+    if (g_wgiCacheInit) {
+        EnterCriticalSection(&g_wgiCacheCs);
+        for (int i = 0; i < g_wgiRawCacheCount; ++i) {
+            if (g_wgiRawCache[i].dev == self) {
+                const WgiRawCacheEntry* e = &g_wgiRawCache[i];
+                LeaveCriticalSection(&g_wgiCacheCs);
+                return e;
+            }
+        }
+        LeaveCriticalSection(&g_wgiCacheCs);
+    }
+
+    WgiRawCacheEntry entry{};
+    entry.dev = self;
+    entry.btnCount = btnCount;
+    void** vtbl = *reinterpret_cast<void***>(self);
+    auto fnGetLabel = reinterpret_cast<FnWgiRawGetButtonLabel>(vtbl[12]);
+    for (uint32_t i = 0; i < btnCount; ++i) {
+        int32_t lbl = 0;
+        if (fnGetLabel && SUCCEEDED(fnGetLabel(self, static_cast<int32_t>(i), &lbl))) {
+            entry.labels[i] = lbl;
+        }
+    }
+
+    if (g_wgiCacheInit) {
+        EnterCriticalSection(&g_wgiCacheCs);
+        if (g_wgiRawCacheCount < 16) {
+            g_wgiRawCache[g_wgiRawCacheCount] = entry;
+            const WgiRawCacheEntry* e = &g_wgiRawCache[g_wgiRawCacheCount++];
+            LeaveCriticalSection(&g_wgiCacheCs);
+            return e;
+        }
+        LeaveCriticalSection(&g_wgiCacheCs);
+    }
+    return nullptr;
+}
+
+static HRESULT STDMETHODCALLTYPE Hooked_WGI_RawGameController_GetCurrentReading(
+    void* self,
+    uint32_t buttonsSize, uint8_t* buttons,
+    uint32_t switchesSize, int32_t* switches,
+    uint32_t axesSize, double* axes,
+    uint64_t* timestamp) {
+    HRESULT hr = g_origWgiRawGetReading(self, buttonsSize, buttons, switchesSize, switches, axesSize, axes, timestamp);
+    if (!g_wgiRawCallLogged) {
+        g_wgiRawCallLogged = true;
+        CoreLog("WGI IRawGameController::GetCurrentReading active (btns=%u sw=%u axes=%u)",
+                buttonsSize, switchesSize, axesSize);
+    }
+    if (SUCCEEDED(hr) && ShouldSpoofFocus() && IsGameCurrentlyBackground()) {
+        XINPUT_STATE xs{};
+        DWORD usedSlot = 0;
+        if (ReadBackgroundXInput(0, &xs, &usedSlot)) {
+            WORD b = xs.Gamepad.wButtons;
+            BYTE lt = xs.Gamepad.bLeftTrigger;
+            BYTE rt = xs.Gamepad.bRightTrigger;
+
+            if (buttons && buttonsSize > 0) {
+                const WgiRawCacheEntry* meta = GetOrInitWgiRawLabels(self, buttonsSize);
+                bool anyLabelMapped = false;
+                if (meta) {
+                    for (uint32_t i = 0; i < buttonsSize && i < meta->btnCount; ++i) {
+                        uint8_t pressed = 0;
+                        if (MapLabelToXInputButton(meta->labels[i], b, lt, rt, pressed)) {
+                            buttons[i] = pressed;
+                            anyLabelMapped = true;
+                        }
+                    }
+                }
+                if (!anyLabelMapped) {
+                    static const WORD kStdOrder[10] = {
+                        XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y,
+                        XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER,
+                        XINPUT_GAMEPAD_BACK, XINPUT_GAMEPAD_START,
+                        XINPUT_GAMEPAD_LEFT_THUMB, XINPUT_GAMEPAD_RIGHT_THUMB
+                    };
+                    for (uint32_t i = 0; i < buttonsSize && i < 10; ++i) {
+                        buttons[i] = (b & kStdOrder[i]) ? 1 : 0;
+                    }
+                }
+            }
+
+            if (switches && switchesSize >= 1) {
+                switches[0] = DpadToSwitchPos(b);
+            }
+
+            if (axes && axesSize >= 4) {
+                axes[0] = NormalizeThumbUnit(xs.Gamepad.sThumbLX, false);
+                axes[1] = NormalizeThumbUnit(xs.Gamepad.sThumbLY, true);
+                axes[2] = NormalizeThumbUnit(xs.Gamepad.sThumbRX, false);
+                axes[3] = NormalizeThumbUnit(xs.Gamepad.sThumbRY, true);
+                if (axesSize >= 6) {
+                    axes[4] = static_cast<double>(lt) / 255.0;
+                    axes[5] = static_cast<double>(rt) / 255.0;
+                } else if (axesSize == 5) {
+                    axes[4] = 0.5 + (static_cast<double>(lt) - static_cast<double>(rt)) / 510.0;
+                }
+            }
+
+            if (timestamp) {
+                *timestamp = NowMicrosecondsQpc();
+            }
+
+            if (!g_wgiRawBridgeLogged) {
+                g_wgiRawBridgeLogged = true;
+                CoreLog("WGI IRawGameController background read bridged via XInput (slot=%lu, btns=%u sw=%u axes=%u)",
+                        static_cast<unsigned long>(usedSlot), buttonsSize, switchesSize, axesSize);
+            }
+        }
+    }
+    return hr;
+}
+
+static void TryHookWindowsGamingInput() {
+    if (g_wgiGamepadHooked && g_wgiRawHooked) return;
+    HMODULE wgiMod = GetModuleHandleW(L"Windows.Gaming.Input.dll");
+    if (!wgiMod) return;
+    HMODULE combase = GetModuleHandleW(L"combase.dll");
+    if (!combase) return;
+
+    auto fnRoInit = reinterpret_cast<FnRoInitialize>(GetProcAddress(combase, "RoInitialize"));
+    auto fnRoGetFactory = reinterpret_cast<FnRoGetActivationFactory>(GetProcAddress(combase, "RoGetActivationFactory"));
+    auto fnCreateStrRef = reinterpret_cast<FnWindowsCreateStringReference>(GetProcAddress(combase, "WindowsCreateStringReference"));
+    if (!fnRoGetFactory || !fnCreateStrRef) return;
+
+    if (!g_wgiRoInitDone && fnRoInit) {
+        fnRoInit(1); // RO_INIT_MULTITHREADED
+        g_wgiRoInitDone = true;
+    }
+
+    if (!g_wgiGamepadHooked) {
+        static const wchar_t kClassName[] = L"Windows.Gaming.Input.Gamepad";
+        WgiHStringHeader hdr{};
+        WgiHString hstr = nullptr;
+        if (SUCCEEDED(fnCreateStrRef(kClassName, static_cast<UINT32>(wcslen(kClassName)), &hdr, &hstr))) {
+            void* statics = nullptr;
+            if (SUCCEEDED(fnRoGetFactory(hstr, kIID_IGamepadStatics, &statics)) && statics) {
+                void** svtbl = *reinterpret_cast<void***>(statics);
+                auto fnGetGamepads = reinterpret_cast<FnWgiStaticsGetList>(svtbl[10]);
+                void* vec = nullptr;
+                if (fnGetGamepads && SUCCEEDED(fnGetGamepads(statics, &vec)) && vec) {
+                    void** vvtbl = *reinterpret_cast<void***>(vec);
+                    auto fnGetAt = reinterpret_cast<FnWgiVecGetAt>(vvtbl[6]);
+                    auto fnGetSize = reinterpret_cast<FnWgiVecGetSize>(vvtbl[7]);
+                    uint32_t count = 0;
+                    if (fnGetSize && fnGetAt && SUCCEEDED(fnGetSize(vec, &count)) && count > 0) {
+                        void* gp = nullptr;
+                        if (SUCCEEDED(fnGetAt(vec, 0, &gp)) && gp) {
+                            void** gvtbl = *reinterpret_cast<void***>(gp);
+                            void* pGetReading = gvtbl[8];
+                            if (MH_CreateHook(pGetReading,
+                                              reinterpret_cast<void*>(&Hooked_WGI_Gamepad_GetCurrentReading),
+                                              reinterpret_cast<void**>(&g_origWgiGamepadGetReading)) == MH_OK) {
+                                MH_EnableHook(pGetReading);
+                                g_wgiGamepadHooked = true;
+                                CoreLog("Hooked Windows.Gaming.Input IGamepad::GetCurrentReading (background XInput bridge)");
+                            }
+                            static_cast<IUnknown*>(gp)->Release();
+                        }
+                    }
+                    static_cast<IUnknown*>(vec)->Release();
+                }
+                static_cast<IUnknown*>(statics)->Release();
+            }
+        }
+    }
+
+    if (!g_wgiRawHooked) {
+        static const wchar_t kClassName[] = L"Windows.Gaming.Input.RawGameController";
+        WgiHStringHeader hdr{};
+        WgiHString hstr = nullptr;
+        if (SUCCEEDED(fnCreateStrRef(kClassName, static_cast<UINT32>(wcslen(kClassName)), &hdr, &hstr))) {
+            void* statics = nullptr;
+            if (SUCCEEDED(fnRoGetFactory(hstr, kIID_IRawGameControllerStatics, &statics)) && statics) {
+                void** svtbl = *reinterpret_cast<void***>(statics);
+                auto fnGetList = reinterpret_cast<FnWgiStaticsGetList>(svtbl[10]);
+                void* vec = nullptr;
+                if (fnGetList && SUCCEEDED(fnGetList(statics, &vec)) && vec) {
+                    void** vvtbl = *reinterpret_cast<void***>(vec);
+                    auto fnGetAt = reinterpret_cast<FnWgiVecGetAt>(vvtbl[6]);
+                    auto fnGetSize = reinterpret_cast<FnWgiVecGetSize>(vvtbl[7]);
+                    uint32_t count = 0;
+                    if (fnGetSize && fnGetAt && SUCCEEDED(fnGetSize(vec, &count)) && count > 0) {
+                        void* rgc = nullptr;
+                        if (SUCCEEDED(fnGetAt(vec, 0, &rgc)) && rgc) {
+                            void** rvtbl = *reinterpret_cast<void***>(rgc);
+                            void* pGetReading = rvtbl[13];
+                            if (MH_CreateHook(pGetReading,
+                                              reinterpret_cast<void*>(&Hooked_WGI_RawGameController_GetCurrentReading),
+                                              reinterpret_cast<void**>(&g_origWgiRawGetReading)) == MH_OK) {
+                                MH_EnableHook(pGetReading);
+                                g_wgiRawHooked = true;
+                                CoreLog("Hooked Windows.Gaming.Input IRawGameController::GetCurrentReading (background XInput bridge)");
+                            }
+                            static_cast<IUnknown*>(rgc)->Release();
+                        }
+                    }
+                    static_cast<IUnknown*>(vec)->Release();
+                }
+                static_cast<IUnknown*>(statics)->Release();
+            }
+        }
+    }
+}
+
 void TryHookLazyInputModules() {
     TryHookXInput();
     TryHookDirectInput8();
     TryHookGameInput();
+    TryHookWindowsGamingInput();
 }
 
 void ShutdownInputHooks() {
+    if (g_wgiCacheInit) {
+        DeleteCriticalSection(&g_wgiCacheCs);
+        g_wgiCacheInit = false;
+    }
     if (g_diCacheInit) {
         DeleteCriticalSection(&g_diCacheCs);
         g_diCacheInit = false;

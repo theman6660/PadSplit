@@ -45,7 +45,8 @@ Windows only allows a single foreground window at a time. On a dual-monitor setu
 - **Full Gamepad Background Keep-Alive**:
   - **XInput** (`xinput1_4`, `xinput1_3`, `xinput9_1_0` — blocks `XInputEnable(FALSE)`)
   - **DirectInput 8** (rewrites `DISCL_FOREGROUND | DISCL_EXCLUSIVE` to `DISCL_BACKGROUND | DISCL_NONEXCLUSIVE` and auto-reacquires)
-  - **Raw Input** (automatically appends `RIDEV_INPUTSINK` for gamepad/joystick HID usages)
+  - **Raw Input** (automatically appends `RIDEV_INPUTSINK` for gamepad/joystick/multi-axis HID usages and rewrites `RIM_INPUTSINK` to `RIM_INPUT` for background HID messages)
+  - **Windows.Gaming.Input (WinRT)** (hooks `IGamepad::GetCurrentReading` & `IRawGameController::GetCurrentReading` and bridges live XInput state in the background — fixes Unity 2021+/Unity 6 and WGI titles)
   - **Microsoft GameInput (v1–v4)** (enables background input policy and filters KBM readings while preserving gamepad)
   - **DirectSound** (`DSBCAPS_GLOBALFOCUS` fallback for older titles that mute on focus loss)
 - **Layered Borderless Fullscreen**: Zero-rendering-overhead window style strip by default (safe with ReShade / RTSS / DLSS overlays), plus an optional `force-dx` mode hooking DXGI `SetFullscreenState` & D3D9 `CreateDevice`/`Reset` for legacy exclusive-fullscreen games.
